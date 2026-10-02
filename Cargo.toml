@@ -1,0 +1,16 @@
+[package]
+name = "earlyoom"
+version = "0.1.0"
+edition = "2024"
+description = "early OOM daemon for macOS - kills the largest process before the system runs out of memory"
+license = "MIT"
+repository = "https://github.com/haydenflinner/earlyoom-rs-mac"
+keywords = ["oom", "memory", "macos", "daemon"]
+categories = ["os::macos-apis"]
+
+[dependencies]
+libc = "0.2.190"
+mach2 = "0.7.0"
+pico-args = { version = "0.5.0", features = ["eq-separator"] }
+regex-lite = "0.1.9"
+sysinfo = "0.39.6"

@@ -1,0 +1,42 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!--
+  LaunchAgent for earlyoom on macOS.
+
+  Runs in the user session, which is enough to kill the user's own
+  processes (browsers, build jobs, test binaries). No root needed.
+
+  Install:
+    cargo build --release
+    install -m 755 target/release/earlyoom /usr/local/bin/earlyoom
+    cp com.earlyoom.earlyoom.plist ~/Library/LaunchAgents/
+    launchctl load ~/Library/LaunchAgents/com.earlyoom.earlyoom.plist
+
+  Logs go to /tmp/earlyoom.{out,err}.log - change paths below if you like.
+-->
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>com.earlyoom.earlyoom</string>
+    <key>ProgramArguments</key>
+    <array>
+        <string>/usr/local/bin/earlyoom</string>
+        <!-- Tune to taste, e.g.: -->
+        <!-- <string>-m</string><string>10</string> -->
+        <!-- <string>--prefer</string><string>chrome|cargo|rustc</string> -->
+        <!-- <string>--avoid</string><string>WindowServer|loginwindow</string> -->
+        <!-- <string>-n</string> -->
+    </array>
+    <key>RunAtLoad</key>
+    <true/>
+    <key>KeepAlive</key>
+    <true/>
+    <!-- Be nice: earlyoom should not itself become a memory hog. -->
+    <key>StandardOutPath</key>
+    <string>/tmp/earlyoom.out.log</string>
+    <key>StandardErrorPath</key>
+    <string>/tmp/earlyoom.err.log</string>
+    <key>ProcessType</key>
+    <string>Background</string>
+</dict>
+</plist>
