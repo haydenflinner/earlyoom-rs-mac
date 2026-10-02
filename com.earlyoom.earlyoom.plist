@@ -10,7 +10,7 @@
     cargo build --release
     install -m 755 target/release/earlyoom /usr/local/bin/earlyoom
     cp com.earlyoom.earlyoom.plist ~/Library/LaunchAgents/
-    launchctl load ~/Library/LaunchAgents/com.earlyoom.earlyoom.plist
+    launchctl bootstrap "gui/$UID" ~/Library/LaunchAgents/com.earlyoom.earlyoom.plist
 
   Logs go to /tmp/earlyoom.{out,err}.log - change paths below if you like.
 -->

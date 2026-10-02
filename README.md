@@ -73,7 +73,17 @@ Running as your user is enough to kill your own processes — no root needed:
 ```console
 install -m 755 target/release/earlyoom /usr/local/bin/earlyoom
 cp com.earlyoom.earlyoom.plist ~/Library/LaunchAgents/
-launchctl load ~/Library/LaunchAgents/com.earlyoom.earlyoom.plist
+launchctl bootstrap "gui/$UID" ~/Library/LaunchAgents/com.earlyoom.earlyoom.plist
+```
+
+Do not use `sudo`: a LaunchAgent lives in your `gui/$UID` domain, and the
+`system` domain will reject a plist under `~/Library/LaunchAgents`.
+
+To reload after editing the plist or installing a new binary:
+
+```console
+launchctl bootout "gui/$UID/com.earlyoom.earlyoom"
+launchctl bootstrap "gui/$UID" ~/Library/LaunchAgents/com.earlyoom.earlyoom.plist
 ```
 
 Logs go to `/tmp/earlyoom.{out,err}.log`. Edit the plist's
