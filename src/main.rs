@@ -75,7 +75,7 @@ fn sleep_time_ms(args: &Args, m: &MemInfo) -> u64 {
     const MIN_SLEEP: u64 = 100;
     const MAX_SLEEP: u64 = 1000;
 
-    let mem_headroom = ((m.mem_available_percent - args.mem_term_percent)
+    let mem_headroom = ((m.effective_mem_percent() - args.mem_term_percent)
         * m.user_mem_total_kib as f64
         / 100.0)
         .max(0.0);
@@ -230,11 +230,11 @@ fn main() {
         m.mem_available_kib / 1024
     ));
     eprintln!(
-        "sending SIGTERM when mem avail <= {:5.2}% and swap free <= {:5.2}%,",
+        "sending SIGTERM when min(mem avail, kernel level) <= {:5.2}% and swap free <= {:5.2}%,",
         args.mem_term_percent, args.swap_term_percent
     );
     eprintln!(
-        "        SIGKILL when mem avail <= {:5.2}% and swap free <= {:5.2}%",
+        "        SIGKILL when min(mem avail, kernel level) <= {:5.2}% and swap free <= {:5.2}%",
         args.mem_kill_percent, args.swap_kill_percent
     );
 

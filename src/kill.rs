@@ -182,21 +182,23 @@ fn run_prehook(args: &Args, victim: &ProcInfo) {
 }
 
 pub fn below_term_limits(args: &Args, m: &MemInfo) -> bool {
-    m.mem_available_percent <= args.mem_term_percent
+    m.effective_mem_percent() <= args.mem_term_percent
         && m.swap_free_percent <= args.swap_term_percent
 }
 
 pub fn below_kill_limits(args: &Args, m: &MemInfo) -> bool {
-    m.mem_available_percent <= args.mem_kill_percent
+    m.effective_mem_percent() <= args.mem_kill_percent
         && m.swap_free_percent <= args.swap_kill_percent
 }
 
 pub fn mem_stats_line(m: &MemInfo) -> String {
     format!(
-        "mem avail: {:5} of {:5} MiB ({:5.2}%), swap free: {:4} of {:4} MiB ({:5.2}%)",
+        "mem avail: {:5} of {:5} MiB ({:5.2}%), kernel level: {:5.2}%, compressor: {:5} MiB, swap free: {:4} of {:4} MiB ({:5.2}%)",
         m.mem_available_kib / 1024,
         m.user_mem_total_kib / 1024,
         m.mem_available_percent,
+        m.kernel_level_percent,
+        m.compressor_kib / 1024,
         m.swap_free_kib / 1024,
         m.swap_total_kib / 1024,
         m.swap_free_percent,

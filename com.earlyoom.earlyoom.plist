@@ -8,7 +8,7 @@
 
   Install:
     cargo build --release
-    install -m 755 target/release/earlyoom /usr/local/bin/earlyoom
+    install -m 755 target/release/earlyoom ~/.local/bin/earlyoom
     cp com.earlyoom.earlyoom.plist ~/Library/LaunchAgents/
     launchctl bootstrap "gui/$UID" ~/Library/LaunchAgents/com.earlyoom.earlyoom.plist
 
@@ -20,10 +20,10 @@
     <string>com.earlyoom.earlyoom</string>
     <key>ProgramArguments</key>
     <array>
-        <string>/usr/local/bin/earlyoom</string>
+        <string>/Users/wow/.local/bin/earlyoom</string>
+        <string>--prefer</string><string>rustc|cargo|clang|clang\+\+|\bld\b|lld|ld64</string>
         <!-- Tune to taste, e.g.: -->
         <!-- <string>-m</string><string>10</string> -->
-        <!-- <string>--prefer</string><string>chrome|cargo|rustc</string> -->
         <!-- <string>--avoid</string><string>WindowServer|loginwindow</string> -->
         <!-- <string>-n</string> -->
     </array>

@@ -30,8 +30,42 @@ pub struct MemInfo {
     pub anon_pages_kib: u64,
     /// mem_available_kib + anon_pages_kib
     pub user_mem_total_kib: u64,
+    /// Pages currently held by the VM compressor.
+    pub compressor_kib: u64,
     pub mem_available_percent: f64,
     pub swap_free_percent: f64,
+    /// kern.memorystatus_level: the kernel's own "percent of memory free"
+    /// figure - the same number jetsam acts on. 100.0 when unreadable, so
+    /// it can never trip the trigger by accident.
+    pub kernel_level_percent: f64,
+}
+
+impl MemInfo {
+    /// The more pessimistic of our computed availability and the kernel's
+    /// memorystatus level. Our metric counts all uncompressed pages as
+    /// available, which stays deceptively high once the compressor is
+    /// saturated and swap cannot grow (vm-compressor-space-shortage).
+    pub fn effective_mem_percent(&self) -> f64 {
+        self.mem_available_percent.min(self.kernel_level_percent)
+    }
+}
+
+fn sysctl_i32(name: &std::ffi::CStr) -> Result<i32, std::io::Error> {
+    let mut val: i32 = 0;
+    let mut len = std::mem::size_of::<i32>();
+    let res = unsafe {
+        libc::sysctlbyname(
+            name.as_ptr(),
+            &mut val as *mut i32 as *mut libc::c_void,
+            &mut len,
+            std::ptr::null_mut(),
+            0,
+        )
+    };
+    if res != 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    Ok(val)
 }
 
 fn sysctl_u64(name: &std::ffi::CStr) -> Result<u64, std::io::Error> {
@@ -124,6 +158,7 @@ pub fn parse_meminfo() -> Result<MemInfo, std::io::Error> {
             .saturating_sub(u64::from(vm.purgeable_count)),
     );
     let user_mem_total = mem_available + anon_pages;
+    let compressor_kib = pages(u64::from(vm.compressor_page_count));
 
     let mem_available_percent = if user_mem_total > 0 {
         mem_available as f64 * 100.0 / user_mem_total as f64
@@ -135,6 +170,12 @@ pub fn parse_meminfo() -> Result<MemInfo, std::io::Error> {
     } else {
         0.0
     };
+    // Higher = healthier, same as mem_available_percent. Absent or
+    // out-of-range values degrade to "no opinion".
+    let kernel_level_percent = match sysctl_i32(c"kern.memorystatus_level") {
+        Ok(level) if (0..=100).contains(&level) => level as f64,
+        _ => 100.0,
+    };
 
     Ok(MemInfo {
         mem_total_kib: mem_total,
@@ -143,7 +184,9 @@ pub fn parse_meminfo() -> Result<MemInfo, std::io::Error> {
         swap_free_kib: swap_free,
         anon_pages_kib: anon_pages,
         user_mem_total_kib: user_mem_total,
+        compressor_kib,
         mem_available_percent,
         swap_free_percent,
+        kernel_level_percent,
     })
 }

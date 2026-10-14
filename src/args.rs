@@ -124,6 +124,10 @@ macOS notes:
     (like --sort-by-rss on Linux).
   * kernel_task (pid 0) and launchd (pid 1) are never killed.
   * --kernel-oom does not exist on macOS.
+  * The memory trigger uses the lower of our computed available-memory
+    estimate and the kernel's own kern.memorystatus_level (the jetsam
+    free-memory percentage), so it still fires when the VM compressor is
+    saturated and uncompressed pages only look 'available' on paper.
 ";
 
 pub fn parse_args(m: &MemInfo, argv0: &str) -> Args {
