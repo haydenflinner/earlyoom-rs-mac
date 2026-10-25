@@ -10,7 +10,7 @@ use std::time::{Duration, Instant};
 use sysinfo::System;
 
 use crate::args::Args;
-use crate::meminfo::{self, MemInfo};
+use crate::meminfo::{self, MemInfo, PRESSURE_CRITICAL, PRESSURE_WARN};
 use crate::procs::{self, ProcInfo};
 use crate::{debug, info, warn};
 
@@ -109,7 +109,7 @@ fn add_victim_env(cmd: &mut Command, victim: &ProcInfo) {
         .env("EARLYOOM_UID", victim.uid.to_string())
         .env("EARLYOOM_NAME", &victim.name)
         .env("EARLYOOM_CMDLINE", &victim.cmdline)
-        .env("EARLYOOM_VM_RSS_MB", (victim.rss_kib / 1024).to_string());
+        .env("EARLYOOM_VM_RSS_MB", (victim.mem_kib / 1024).to_string());
 }
 
 /// "-n" option: macOS notification via osascript.
@@ -181,27 +181,61 @@ fn run_prehook(args: &Args, victim: &ProcInfo) {
     }
 }
 
+fn mem_below(m: &MemInfo, mem_percent: f64, swap_percent: f64) -> bool {
+    m.effective_mem_percent() <= mem_percent && m.swap_free_percent <= swap_percent
+}
+
+fn swap_grown_above(m: &MemInfo, limit_kib: u64) -> bool {
+    m.pressure_level >= PRESSURE_WARN && m.swap_grown_kib >= limit_kib
+}
+
+fn pressure_critical(args: &Args, m: &MemInfo) -> bool {
+    args.pressure_trigger && m.pressure_level == PRESSURE_CRITICAL
+}
+
 pub fn below_term_limits(args: &Args, m: &MemInfo) -> bool {
-    m.effective_mem_percent() <= args.mem_term_percent
-        && m.swap_free_percent <= args.swap_term_percent
+    mem_below(m, args.mem_term_percent, args.swap_term_percent)
+        || pressure_critical(args, m)
+        || swap_grown_above(m, args.swap_grow_term_kib)
 }
 
 pub fn below_kill_limits(args: &Args, m: &MemInfo) -> bool {
-    m.effective_mem_percent() <= args.mem_kill_percent
-        && m.swap_free_percent <= args.swap_kill_percent
+    mem_below(m, args.mem_kill_percent, args.swap_kill_percent)
+        || swap_grown_above(m, args.swap_grow_kill_kib)
+}
+
+/// Which triggers fired, for the log.
+pub fn trigger_reason(args: &Args, m: &MemInfo, kill: bool) -> String {
+    let (mem, swap, grow) = if kill {
+        (args.mem_kill_percent, args.swap_kill_percent, args.swap_grow_kill_kib)
+    } else {
+        (args.mem_term_percent, args.swap_term_percent, args.swap_grow_term_kib)
+    };
+    let mut why = Vec::new();
+    if mem_below(m, mem, swap) {
+        why.push(format!("mem <= {:.2}%, swap free <= {:.2}%", mem, swap));
+    }
+    if !kill && pressure_critical(args, m) {
+        why.push("kernel memory pressure critical".to_string());
+    }
+    if swap_grown_above(m, grow) {
+        why.push(format!("swap grew >= {} MiB under pressure", grow / 1024));
+    }
+    why.join("; ")
 }
 
 pub fn mem_stats_line(m: &MemInfo) -> String {
     format!(
-        "mem avail: {:5} of {:5} MiB ({:5.2}%), kernel level: {:5.2}%, compressor: {:5} MiB, swap free: {:4} of {:4} MiB ({:5.2}%)",
+        "mem avail: {:5} of {:5} MiB ({:5.2}%), kernel level: {:5.2}%, pressure: {:8}, compressor: {:5} MiB, swap used: {:5} of {:5} MiB (+{} MiB)",
         m.mem_available_kib / 1024,
         m.user_mem_total_kib / 1024,
         m.mem_available_percent,
         m.kernel_level_percent,
+        meminfo::pressure_name(m.pressure_level),
         m.compressor_kib / 1024,
-        m.swap_free_kib / 1024,
+        m.swap_used_kib / 1024,
         m.swap_total_kib / 1024,
-        m.swap_free_percent,
+        m.swap_grown_kib / 1024,
     )
 }
 
@@ -218,12 +252,12 @@ fn sig_name(sig: libc::c_int) -> &'static str {
 pub fn kill_process(sys: &mut System, args: &Args, sig: libc::c_int, victim: &ProcInfo) {
     let sig_name = sig_name(sig);
     warn(&format!(
-        "sending {} to process {} uid {} \"{}\": VmRSS {} MiB, cmdline \"{}\"",
+        "sending {} to process {} uid {} \"{}\": footprint {} MiB, cmdline \"{}\"",
         sig_name,
         victim.pid,
         victim.uid,
         victim.name,
-        victim.rss_kib / 1024,
+        victim.mem_kib / 1024,
         victim.cmdline,
     ));
 
@@ -267,8 +301,11 @@ mod tests {
         Args {
             mem_term_percent: 10.0,
             mem_kill_percent: 5.0,
-            swap_term_percent: 10.0,
-            swap_kill_percent: 5.0,
+            swap_term_percent: 100.0,
+            swap_kill_percent: 100.0,
+            swap_grow_term_kib: 1 << 20,
+            swap_grow_kill_kib: 2 << 20,
+            pressure_trigger: true,
             report_interval_ms: 0,
             notify: false,
             notify_ext: None,
@@ -294,6 +331,56 @@ mod tests {
         kill_wait(&mut sys, &test_args(), pid, libc::SIGTERM).unwrap();
         assert!(!procs::is_alive(&mut sys, pid));
         let _ = child.wait();
+    }
+
+    fn calm() -> MemInfo {
+        MemInfo {
+            mem_available_percent: 50.0,
+            kernel_level_percent: 90.0,
+            swap_free_percent: 50.0,
+            swap_total_kib: 16 << 20,
+            swap_used_kib: 8 << 20,
+            swap_grown_kib: 0,
+            pressure_level: meminfo::PRESSURE_NORMAL,
+            ..Default::default()
+        }
+    }
+
+    /// Lots of free swap must not hold back the memory trigger.
+    #[test]
+    fn free_swap_does_not_block() {
+        let mut m = calm();
+        m.mem_available_percent = 4.0;
+        assert!(below_kill_limits(&test_args(), &m));
+    }
+
+    #[test]
+    fn critical_pressure_terms() {
+        let mut m = calm();
+        m.swap_used_kib = 0;
+        assert!(!below_term_limits(&test_args(), &m));
+        m.pressure_level = PRESSURE_CRITICAL;
+        assert!(below_term_limits(&test_args(), &m));
+        assert!(!below_kill_limits(&test_args(), &m));
+        let mut args = test_args();
+        args.pressure_trigger = false;
+        assert!(!below_term_limits(&args, &m));
+    }
+
+    /// Leftover swap (8 GiB used in calm()) never triggers; growth under
+    /// pressure does.
+    #[test]
+    fn swap_growth_needs_pressure() {
+        let mut m = calm();
+        m.pressure_level = PRESSURE_WARN;
+        assert!(!below_term_limits(&test_args(), &m));
+        m.swap_grown_kib = 3 << 20;
+        assert!(below_kill_limits(&test_args(), &m));
+        m.swap_grown_kib = 3 << 19;
+        assert!(below_term_limits(&test_args(), &m));
+        assert!(!below_kill_limits(&test_args(), &m));
+        m.pressure_level = meminfo::PRESSURE_NORMAL;
+        assert!(!below_term_limits(&test_args(), &m));
     }
 
     /// In dryrun mode nothing is sent and the victim stays alive.

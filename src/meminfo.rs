@@ -6,19 +6,25 @@
 //!   - hw.memsize            -> total physical memory
 //!   - host_statistics64()   -> vm_statistics64 page counters
 //!   - vm.swapusage          -> swap total/free
+//!   - kern.memorystatus_vm_pressure_level -> the kernel's pressure verdict
 //!
-//! "MemAvailable" is approximated using Apple's own definition of
-//! AVAILABLE_NON_COMPRESSED_MEMORY = active + inactive + free + speculative
-//! pages (see xnu doc/vm/memorystatus_notify.md), i.e. all memory that is
-//! currently not compressed. This drops exactly when the VM compressor and
-//! swapper start working - the "system grinding" symptom we want to prevent.
+//! "MemAvailable" is approximated like Linux's: memory that can be had
+//! without compressing or swapping anything, i.e. free + file-backed
+//! (external, which includes speculative) + purgeable pages.
 //!
 //! "AnonPages" (memory that user processes actually hold) is approximated
-//! as internal + compressor - purgeable pages. Together with the available
-//! figure this gives UserMemTotal, the denominator for the
-//! available-memory percentage, matching earlyoom's semantics.
+//! as internal - purgeable + compressor pages. The two are disjoint, and
+//! together give UserMemTotal, the denominator for the available-memory
+//! percentage, matching earlyoom's semantics. (Counting active + inactive
+//! as available, as Apple's AVAILABLE_NON_COMPRESSED_MEMORY does, counts
+//! every resident anonymous page twice and never drops below ~50%.)
 
 use std::mem::MaybeUninit;
+use std::sync::atomic::{AtomicU64, Ordering};
+
+/// Lowest swap use seen in the current pressure episode (reset to the
+/// current value whenever pressure is normal).
+static SWAP_BASELINE_KIB: AtomicU64 = AtomicU64::new(0);
 
 /// All sizes in KiB, percentages in 0.0..=100.0.
 #[derive(Debug, Default, Clone, Copy)]
@@ -26,7 +32,11 @@ pub struct MemInfo {
     pub mem_total_kib: u64,
     pub mem_available_kib: u64,
     pub swap_total_kib: u64,
-    pub swap_free_kib: u64,
+    pub swap_used_kib: u64,
+    /// How much swap use grew since memory pressure was last normal. Unlike
+    /// swap_used_kib this drops back to zero: swapped pages linger long
+    /// after the memory they were evicted for is free again.
+    pub swap_grown_kib: u64,
     pub anon_pages_kib: u64,
     /// mem_available_kib + anon_pages_kib
     pub user_mem_total_kib: u64,
@@ -36,15 +46,31 @@ pub struct MemInfo {
     pub swap_free_percent: f64,
     /// kern.memorystatus_level: the kernel's own "percent of memory free"
     /// figure - the same number jetsam acts on. 100.0 when unreadable, so
-    /// it can never trip the trigger by accident.
+    /// it can never trip the trigger by accident. It only counts pages the
+    /// compressor holds as used, so it stays high until the compressor
+    /// fills RAM.
     pub kernel_level_percent: f64,
+    /// kern.memorystatus_vm_pressure_level: PRESSURE_NORMAL, _WARN or
+    /// _CRITICAL. NORMAL when unreadable.
+    pub pressure_level: i32,
+}
+
+pub const PRESSURE_NORMAL: i32 = 1;
+pub const PRESSURE_WARN: i32 = 2;
+pub const PRESSURE_CRITICAL: i32 = 4;
+
+pub fn pressure_name(level: i32) -> &'static str {
+    match level {
+        PRESSURE_NORMAL => "normal",
+        PRESSURE_WARN => "warn",
+        PRESSURE_CRITICAL => "critical",
+        _ => "?",
+    }
 }
 
 impl MemInfo {
     /// The more pessimistic of our computed availability and the kernel's
-    /// memorystatus level. Our metric counts all uncompressed pages as
-    /// available, which stays deceptively high once the compressor is
-    /// saturated and swap cannot grow (vm-compressor-space-shortage).
+    /// memorystatus level.
     pub fn effective_mem_percent(&self) -> f64 {
         self.mem_available_percent.min(self.kernel_level_percent)
     }
@@ -145,17 +171,18 @@ pub fn parse_meminfo() -> Result<MemInfo, std::io::Error> {
     let vm = vm_stats()?;
 
     let pages = |n: u64| n.saturating_mul(page_kib);
-    // AVAILABLE_NON_COMPRESSED_MEMORY = active + inactive + free + speculative
+    // free_count excludes speculative pages; external_page_count includes
+    // them (active + inactive + speculative == external + internal).
     let mem_available = pages(
-        u64::from(vm.active_count)
-            .saturating_add(u64::from(vm.inactive_count))
-            .saturating_add(u64::from(vm.free_count))
-            .saturating_add(u64::from(vm.speculative_count)),
-    );
+        u64::from(vm.free_count)
+            .saturating_add(u64::from(vm.external_page_count))
+            .saturating_add(u64::from(vm.purgeable_count)),
+    )
+    .min(mem_total);
     let anon_pages = pages(
         u64::from(vm.internal_page_count)
-            .saturating_add(u64::from(vm.compressor_page_count))
-            .saturating_sub(u64::from(vm.purgeable_count)),
+            .saturating_sub(u64::from(vm.purgeable_count))
+            .saturating_add(u64::from(vm.compressor_page_count)),
     );
     let user_mem_total = mem_available + anon_pages;
     let compressor_kib = pages(u64::from(vm.compressor_page_count));
@@ -176,17 +203,31 @@ pub fn parse_meminfo() -> Result<MemInfo, std::io::Error> {
         Ok(level) if (0..=100).contains(&level) => level as f64,
         _ => 100.0,
     };
+    let pressure_level = match sysctl_i32(c"kern.memorystatus_vm_pressure_level") {
+        Ok(level @ (PRESSURE_WARN | PRESSURE_CRITICAL)) => level,
+        _ => PRESSURE_NORMAL,
+    };
+
+    let swap_used = swap_total.saturating_sub(swap_free);
+    let baseline = if pressure_level == PRESSURE_NORMAL {
+        swap_used
+    } else {
+        SWAP_BASELINE_KIB.load(Ordering::Relaxed).min(swap_used)
+    };
+    SWAP_BASELINE_KIB.store(baseline, Ordering::Relaxed);
 
     Ok(MemInfo {
         mem_total_kib: mem_total,
         mem_available_kib: mem_available,
         swap_total_kib: swap_total,
-        swap_free_kib: swap_free,
+        swap_used_kib: swap_used,
+        swap_grown_kib: swap_used - baseline,
         anon_pages_kib: anon_pages,
         user_mem_total_kib: user_mem_total,
         compressor_kib,
         mem_available_percent,
         swap_free_percent,
         kernel_level_percent,
+        pressure_level,
     })
 }

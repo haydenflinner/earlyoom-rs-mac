@@ -12,7 +12,8 @@
     cp com.earlyoom.earlyoom.plist ~/Library/LaunchAgents/
     launchctl bootstrap "gui/$UID" ~/Library/LaunchAgents/com.earlyoom.earlyoom.plist
 
-  Logs go to /tmp/earlyoom.{out,err}.log - change paths below if you like.
+  Logs go to ~/Library/Logs/earlyoom.{out,err}.log - not /tmp, which macOS
+  clears at boot, taking the post-mortem of a freeze with it.
 -->
 <plist version="1.0">
 <dict>
@@ -22,8 +23,10 @@
     <array>
         <string>/Users/wow/.local/bin/earlyoom</string>
         <string>--prefer</string><string>rustc|cargo|clang|clang\+\+|\bld\b|lld|ld64</string>
+        <!-- Memory report every 60 s; every 1 s under memory pressure. -->
+        <string>-r</string><string>60</string>
         <!-- Tune to taste, e.g.: -->
-        <!-- <string>-m</string><string>10</string> -->
+        <!-- <string>--swap-grow</string><string>1024,2048</string> -->
         <!-- <string>--avoid</string><string>WindowServer|loginwindow</string> -->
         <!-- <string>-n</string> -->
     </array>
@@ -31,12 +34,13 @@
     <true/>
     <key>KeepAlive</key>
     <true/>
-    <!-- Be nice: earlyoom should not itself become a memory hog. -->
     <key>StandardOutPath</key>
-    <string>/tmp/earlyoom.out.log</string>
+    <string>/Users/wow/Library/Logs/earlyoom.out.log</string>
     <key>StandardErrorPath</key>
-    <string>/tmp/earlyoom.err.log</string>
+    <string>/Users/wow/Library/Logs/earlyoom.err.log</string>
+    <!-- Not Background: that throttles CPU and I/O exactly when earlyoom
+         has to page itself back in and act. -->
     <key>ProcessType</key>
-    <string>Background</string>
+    <string>Interactive</string>
 </dict>
 </plist>

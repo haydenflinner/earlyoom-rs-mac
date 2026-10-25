@@ -12,13 +12,13 @@ hungry build jobs (`cargo`, `rustc`, `clang`) eating all of RAM.
 
 ```console
 cargo build --release
-cargo run --release -- -m 12 --prefer 'cargo|rustc|clang|ld64|ld|lld' --avoid 'chrome|WindowServer|loginwindow' -n
+cargo run --release -- --prefer 'cargo|rustc|clang|ld64|ld|lld' --avoid 'chrome|WindowServer|loginwindow' -n
 ```
 
-This sends SIGTERM to the biggest memory hog once uncompressed-available
-memory drops below 12 % (and free swap below 10 %), escalates to SIGKILL at
-half of that, prefers killing compilers/linkers, avoids killing Chrome and
-the window server, and posts a macOS notification on each kill.
+This sends SIGTERM to the biggest memory hog once the machine starts
+swapping under memory pressure (1 GiB of swap growth), escalates to SIGKILL
+at 2 GiB, prefers killing compilers/linkers, avoids killing Chrome and the
+window server, and posts a macOS notification on each kill.
 
 Try it safely first:
 
@@ -36,11 +36,17 @@ Usage: earlyoom [OPTION]...
                             earlyoom sends SIGTERM once below PERCENT, then
                             SIGKILL once below KILL_PERCENT (default PERCENT/2).
   -s PERCENT[,KILL_PERCENT] set free swap minimum to PERCENT of total (default
-                            10 %).
+                            100 %, i.e. off: macOS grows swap on demand).
                             Note: both memory and swap must be below minimum for
-                            earlyoom to act.
+                            the memory trigger to act.
   -M SIZE[,KILL_SIZE]       set available memory minimum to SIZE KiB
   -S SIZE[,KILL_SIZE]       set free swap minimum to SIZE KiB
+  --swap-grow SIZE[,KILL_SIZE]
+                            also act once swap use grows by SIZE MiB while the
+                            kernel reports memory pressure (default 1024,2048;
+                            KILL_SIZE defaults to 2*SIZE)
+  --no-pressure             do not send SIGTERM on critical kernel memory
+                            pressure
   -n                        enable notifications via osascript
   -N /PATH/TO/SCRIPT        call script after oom kill
   -g                        kill all processes within a process group
@@ -58,7 +64,7 @@ Usage: earlyoom [OPTION]...
   -h, --help                this help text
 ```
 
-`--prefer` and `--avoid` shift a process' effective RSS by ±30 % of total
+`--prefer` and `--avoid` shift a process' effective size by ±30 % of total
 memory (mirroring earlyoom's `OOM_SCORE_PREFER`/`OOM_SCORE_AVOID`).
 
 The `-N` hook script receives `EARLYOOM_PID`, `EARLYOOM_UID`,
@@ -86,23 +92,51 @@ launchctl bootout "gui/$UID/com.earlyoom.earlyoom"
 launchctl bootstrap "gui/$UID" ~/Library/LaunchAgents/com.earlyoom.earlyoom.plist
 ```
 
-Logs go to `/tmp/earlyoom.{out,err}.log`. Edit the plist's
-`ProgramArguments` to enable your preferred flags.
+Logs go to `~/Library/Logs/earlyoom.{out,err}.log` (not `/tmp`, which macOS
+clears at boot, taking the post-mortem of a freeze with it). Edit the plist's
+`ProgramArguments` to enable your preferred flags. The plist sets
+`ProcessType` to `Interactive`: `Background` would throttle earlyoom's CPU
+and I/O exactly when it has to run.
 
 ## How it works
 
-* Available memory is computed as Apple's `AVAILABLE_NON_COMPRESSED_MEMORY`
-  = active + inactive + free + speculative pages (see xnu
-  `doc/vm/memorystatus_notify.md`). It drops exactly when the VM compressor
-  and swapper start working — the "system grinding" moment.
+Linux earlyoom's "low memory and low swap" rule does not work on macOS.
+Measured on a 36 GiB M-series machine with a growing memory hog:
+
+* free + file-backed pages level off near 18 % as soon as the compressor
+  starts, and stay there, so a memory threshold can't tell "compressing
+  happily" from "about to thrash".
+* The compressor stops growing near 53 % of RAM (~19.7 GiB), so
+  `kern.memorystatus_level` bottoms out around 36 %; everything after that
+  goes to swap.
+* macOS adds swap files on demand (1, 2, 3, 4 GiB, ...), so "free swap"
+  stays at 15-60 % while the machine thrashes.
+* `kern.memorystatus_vm_pressure_level` turns `warn` shortly before
+  swapping starts. It did not reach `critical` in testing.
+
+So earlyoom acts on any one of:
+
+* swap use growing by `--swap-grow` MiB (default 1024, SIGKILL at 2048)
+  while the kernel reports memory pressure. Growth is counted from the
+  last time pressure was normal, because pages stay in swap long after the
+  memory they were evicted for is free again.
+* critical kernel memory pressure (SIGTERM; `--no-pressure` turns it off).
+* available memory (free + file-backed + purgeable pages, as a share of
+  that plus anonymous and compressor pages, or `kern.memorystatus_level` if
+  lower) below `-m`, and free swap below `-s` (default 100 %, i.e. no swap
+  condition).
+
+Other details:
+
 * Swap comes from the `vm.swapusage` sysctl.
 * Processes are enumerated via `libproc` (`proc_pidinfo`/`KERN_PROCARGS2`).
-* macOS has no `oom_score`; the victim is simply the process with the
-  largest RSS, adjusted by `--prefer`/`--avoid`.
+* macOS has no `oom_score`; the victim is the process with the largest
+  physical footprint (`proc_pid_rusage`), adjusted by `--prefer`/`--avoid`.
+  Unlike RSS, the footprint includes compressed and swapped-out pages.
 
 ## Differences vs. Linux earlyoom
 
-* No `oom_score` / `oom_score_adj` — RSS ranking only.
+* No `oom_score` / `oom_score_adj` — physical footprint ranking only.
 * `--kernel-oom` does not exist (no sysrq-trigger).
 * `mlockall()` is not implemented on macOS; there is no way to lock the
   daemon into RAM.
@@ -113,7 +147,7 @@ Logs go to `/tmp/earlyoom.{out,err}.log`. Edit the plist's
 
 ## Caveats
 
-* Without `--avoid`, the largest RSS process may be something you don't want
+* Without `--avoid`, the largest process may be something you don't want
   to lose (WindowServer logs you out when killed).
 * SIP-protected processes can't be killed even as root; that's fine, they
   just show up as kill failures in the log.

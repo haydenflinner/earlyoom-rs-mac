@@ -10,11 +10,22 @@ use crate::warn;
 
 pub struct Args {
     /// If available memory AND free swap drop below these percentages of
-    /// their totals, we start killing processes.
+    /// their totals, we start killing processes. The swap limits default to
+    /// 100 % (no condition): macOS grows swap on demand, so "free swap"
+    /// stays high until the machine is already thrashing.
     pub mem_term_percent: f64,
     pub mem_kill_percent: f64,
     pub swap_term_percent: f64,
     pub swap_kill_percent: f64,
+    /// --swap-grow: act once swap use has grown this much while the kernel
+    /// reports memory pressure. This is what actually fires on macOS: the
+    /// compressor caps out near half of RAM, so kern.memorystatus_level
+    /// bottoms out around 35 %, and after that everything goes to swap.
+    pub swap_grow_term_kib: u64,
+    pub swap_grow_kill_kib: u64,
+    /// SIGTERM while the kernel reports critical memory pressure
+    /// (disabled by --no-pressure).
+    pub pressure_trigger: bool,
     /// Memory report interval, milliseconds. 0 disables reporting.
     pub report_interval_ms: i64,
     /// Enable macOS notifications via osascript (-n).
@@ -59,6 +70,30 @@ fn parse_part(part: &str, upper_limit: f64) -> Result<f64, String> {
     Ok(val)
 }
 
+/// Parse the "--swap-grow TERM[,KILL]" tuple, in MiB. KILL defaults to
+/// 2*TERM and may not be below TERM.
+pub fn parse_grow_tuple(optarg: &str) -> Result<(u64, u64), String> {
+    let mut parts = optarg.split(',');
+    let num = |p: &str| -> Result<u64, String> {
+        match p.parse::<u64>() {
+            Ok(v) if v > 0 => Ok(v),
+            _ => Err(format!("'{}' is not a positive number of MiB", p)),
+        }
+    };
+    let term = num(parts.next().unwrap_or(""))?;
+    let kill = match parts.next() {
+        Some(p) => num(p)?,
+        None => term.saturating_mul(2),
+    };
+    if parts.next().is_some() {
+        return Err(format!("too many values in '{}'", optarg));
+    }
+    if kill < term {
+        return Err(format!("KILL_SIZE {} is below SIZE {}", kill, term));
+    }
+    Ok((term, kill))
+}
+
 /// Parse the "term[,kill]" tuple. Examples: "123", "123,456".
 /// Returns (term, kill). Ported from parse_term_kill_tuple() in msg.c.
 pub fn parse_term_kill_tuple(optarg: &str, upper_limit: f64) -> Result<(f64, f64), String> {
@@ -98,11 +133,17 @@ Usage: earlyoom [OPTION]...
                             earlyoom sends SIGTERM once below PERCENT, then
                             SIGKILL once below KILL_PERCENT (default PERCENT/2).
   -s PERCENT[,KILL_PERCENT] set free swap minimum to PERCENT of total (default
-                            10 %).
+                            100 %, i.e. off: macOS grows swap on demand).
                             Note: both memory and swap must be below minimum for
-                            earlyoom to act.
+                            the memory trigger to act.
   -M SIZE[,KILL_SIZE]       set available memory minimum to SIZE KiB
   -S SIZE[,KILL_SIZE]       set free swap minimum to SIZE KiB
+  --swap-grow SIZE[,KILL_SIZE]
+                            also act once swap use grows by SIZE MiB while the
+                            kernel reports memory pressure (default 1024,2048;
+                            KILL_SIZE defaults to 2*SIZE)
+  --no-pressure             do not send SIGTERM on critical kernel memory
+                            pressure
   -n                        enable notifications via osascript
   -N /PATH/TO/SCRIPT        call script after oom kill
   -g                        kill all processes within a process group
@@ -120,14 +161,16 @@ Usage: earlyoom [OPTION]...
   -h, --help                this help text
 
 macOS notes:
-  * There is no oom_score on macOS; victims are chosen by RSS
-    (like --sort-by-rss on Linux).
+  * There is no oom_score on macOS; victims are chosen by physical
+    footprint, which unlike RSS includes compressed and swapped-out pages
+    (RSS when the footprint is unreadable).
   * kernel_task (pid 0) and launchd (pid 1) are never killed.
   * --kernel-oom does not exist on macOS.
-  * The memory trigger uses the lower of our computed available-memory
-    estimate and the kernel's own kern.memorystatus_level (the jetsam
-    free-memory percentage), so it still fires when the VM compressor is
-    saturated and uncompressed pages only look 'available' on paper.
+  * Available memory is free + file-backed + purgeable pages, as a share of
+    that plus anonymous and compressor pages. The memory trigger uses the
+    lower of this and kern.memorystatus_level.
+  * Any one trigger is enough: low memory (and swap, if -s is set),
+    critical kernel memory pressure, or --swap-grow.
 ";
 
 pub fn parse_args(m: &MemInfo, argv0: &str) -> Args {
@@ -146,8 +189,11 @@ pub fn parse_args(m: &MemInfo, argv0: &str) -> Args {
     let mut args = Args {
         mem_term_percent: 10.0,
         mem_kill_percent: 5.0,
-        swap_term_percent: 10.0,
-        swap_kill_percent: 5.0,
+        swap_term_percent: 100.0,
+        swap_kill_percent: 100.0,
+        swap_grow_term_kib: 1024 * 1024,
+        swap_grow_kill_kib: 2048 * 1024,
+        pressure_trigger: true,
         report_interval_ms: 1000,
         notify: false,
         notify_ext: None,
@@ -259,6 +305,22 @@ pub fn parse_args(m: &MemInfo, argv0: &str) -> Args {
         }
     }
 
+    // --swap-grow MiB[,KILL_MiB]: more growth is worse, so KILL >= TERM.
+    match pa.opt_value_from_str::<&str, String>("--swap-grow") {
+        Ok(Some(v)) => match parse_grow_tuple(&v) {
+            Ok((t, k)) => {
+                args.swap_grow_term_kib = t * 1024;
+                args.swap_grow_kill_kib = k * 1024;
+            }
+            Err(e) => fatal(16, &format!("--swap-grow: {}", e)),
+        },
+        Ok(None) => {}
+        Err(e) => fatal(16, &format!("--swap-grow: {}", e)),
+    }
+    if pa.contains("--no-pressure") {
+        args.pressure_trigger = false;
+    }
+
     if pa.contains("-n") {
         args.notify = true;
         eprintln!("Notifying through osascript");
@@ -348,7 +410,18 @@ pub fn parse_args(m: &MemInfo, argv0: &str) -> Args {
 
 #[cfg(test)]
 mod tests {
-    use super::parse_term_kill_tuple;
+    use super::{parse_grow_tuple, parse_term_kill_tuple};
+
+    #[test]
+    fn parse_grow() {
+        assert_eq!(parse_grow_tuple("4096"), Ok((4096, 8192)));
+        assert_eq!(parse_grow_tuple("4096,6000"), Ok((4096, 6000)));
+        assert!(parse_grow_tuple("4096,100").is_err());
+        assert!(parse_grow_tuple("0").is_err());
+        assert!(parse_grow_tuple("-1").is_err());
+        assert!(parse_grow_tuple("1,2,3").is_err());
+        assert!(parse_grow_tuple("x").is_err());
+    }
 
     fn ok(s: &str, limit: f64) -> (f64, f64) {
         parse_term_kill_tuple(s, limit).expect(s)

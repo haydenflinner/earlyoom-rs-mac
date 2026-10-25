@@ -75,6 +75,11 @@ fn sleep_time_ms(args: &Args, m: &MemInfo) -> u64 {
     const MIN_SLEEP: u64 = 100;
     const MAX_SLEEP: u64 = 1000;
 
+    // Under kernel memory pressure things can turn fast; poll at full rate.
+    if m.pressure_level >= meminfo::PRESSURE_WARN {
+        return MIN_SLEEP;
+    }
+
     let mem_headroom = ((m.effective_mem_percent() - args.mem_term_percent)
         * m.user_mem_total_kib as f64
         / 100.0)
@@ -136,14 +141,14 @@ fn poll_loop(args: &Args) -> ! {
         if sig == libc::SIGKILL {
             warn(&kill::mem_stats_line(&m));
             warn(&format!(
-                "low memory! at or below SIGKILL limits: mem {:5.2}%, swap {:5.2}%",
-                args.mem_kill_percent, args.swap_kill_percent
+                "low memory! at or below SIGKILL limits: {}",
+                kill::trigger_reason(args, &m, true)
             ));
         } else if sig == libc::SIGTERM {
             warn(&kill::mem_stats_line(&m));
             warn(&format!(
-                "low memory! at or below SIGTERM limits: mem {:5.2}%, swap {:5.2}%",
-                args.mem_term_percent, args.swap_term_percent
+                "low memory! at or below SIGTERM limits: {}",
+                kill::trigger_reason(args, &m, false)
             ));
         }
 
@@ -179,9 +184,18 @@ fn poll_loop(args: &Args) -> ! {
                     }
                 }
             }
-        } else if args.report_interval_ms > 0 && report_countdown_ms <= 0 {
-            info(&kill::mem_stats_line(&m));
-            report_countdown_ms = args.report_interval_ms;
+        } else if args.report_interval_ms > 0 {
+            // Report at least every second under pressure, for post-mortems.
+            let interval = if m.pressure_level >= meminfo::PRESSURE_WARN {
+                args.report_interval_ms.min(1000)
+            } else {
+                args.report_interval_ms
+            };
+            report_countdown_ms = report_countdown_ms.min(interval);
+            if report_countdown_ms <= 0 {
+                info(&kill::mem_stats_line(&m));
+                report_countdown_ms = interval;
+            }
         }
 
         let sleep_ms = sleep_time_ms(args, &m);
@@ -236,6 +250,14 @@ fn main() {
     eprintln!(
         "        SIGKILL when min(mem avail, kernel level) <= {:5.2}% and swap free <= {:5.2}%",
         args.mem_kill_percent, args.swap_kill_percent
+    );
+    if args.pressure_trigger {
+        eprintln!("sending SIGTERM on critical kernel memory pressure");
+    }
+    eprintln!(
+        "under memory pressure: SIGTERM once swap grows {} MiB, SIGKILL at {} MiB",
+        args.swap_grow_term_kib / 1024,
+        args.swap_grow_kill_kib / 1024
     );
 
     // Note: Linux earlyoom calls mlockall() here so it cannot be swapped out
